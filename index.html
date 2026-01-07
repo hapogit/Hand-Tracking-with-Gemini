@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Digital Sphere AR</title>
+    <style>
+        /* --- CSS RESET & STILE BASE --- */
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background-color: #000; 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            user-select: none;
+            cursor: none; /* Cursore nascosto per immersione */
+        }
+
+        /* Container UI */
+        #ui-layer {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 10;
+        }
+
+        /* Loader Minimale */
+        #loader {
+            width: 60px; height: 60px;
+            border: 2px solid rgba(0, 255, 255, 0.1);
+            border-top: 2px solid #00ffff;
+            border-radius: 50%;
+            animation: spin 1s infinite linear;
+            transition: opacity 0.5s;
+        }
+        
+        #status-text {
+            position: absolute;
+            bottom: 30px;
+            color: rgba(0, 255, 255, 0.5);
+            font-size: 0.8rem;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+        }
+
+        /* Elementi Tecnici Nascosti */
+        #input_video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+        
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+<div id="ui-layer">
+    <div id="loader"></div>
+    <div id="status-text">Inizializzazione Sistema...</div>
+</div>
+
+<video id="input_video" playsinline muted></video>
+
+<!-- LIBRERIE -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<script>
+    /**
+     * CONFIGURAZIONE SISTEMA
+     */
+    const CONFIG = {
+        PARTICLE_COUNT: 25000, // Alta risoluzione
+        RADIUS: 4.0,           // Dimensione sfera
+        CAMERA_Z: 10.0,        // Distanza iniziale
+        
+        // Fisica del movimento
+        SMOOTHING_HAND: 0.1,   // Ritardo per fluidità (più basso = più morbido)
+        ROTATION_SPEED: 4.0,   // Moltiplicatore velocità rotazione
+        INERTIA: 0.96,         // Quanto continua a girare dopo il rilascio (0-1)
+        ZOOM_SPEED: 0.1        // Velocità interpolazione zoom
+    };
+
+    // Variabili di Stato Globale
+    const state = {
+        // Input Mano
+        hand: { x: 0.5, y: 0.5 },     // Posizione corrente filtrata
+        targetHand: { x: 0.5, y: 0.5 }, // Posizione raw dal tracker
+        prevHand: { x: 0.5, y: 0.5 },   // Posizione frame precedente
+        
+        // Rotazione
+        rotVel: { x: 0, y: 0.001 },   // Velocità angolare corrente
+        
+        // Zoom
+        zoom: CONFIG.CAMERA_Z,
+        targetZoom: CONFIG.CAMERA_Z,
+        
+        // Flags
+        isTracking: false,
+        isZooming: false
+    };
+
+    // --- 1. SETUP THREE.JS ---
+    
+    // Texture procedurale "Digital Pixel" (Nitida con leggero alone)
+    function createDigitalTexture() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 32; canvas.height = 32;
+        const ctx = canvas.getContext('2d');
+        
+        // Centro solido
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(16, 16, 6, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Glow esterno
+        const grad = ctx.createRadialGradient(16, 16, 6, 16, 16, 16);
+        grad.addColorStop(0, 'rgba(0, 255, 255, 0.5)');
+        grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 32, 32);
+        
+        return new THREE.CanvasTexture(canvas);
+    }
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    scene.fog = new THREE.FogExp2(0x000000, 0.04); // Profondità
+
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.z = CONFIG.CAMERA_Z;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio); // Fondamentale per "Ultra Risoluzione"
+    document.body.appendChild(renderer.domElement);
+
+    // --- 2. GENERAZIONE SFERA DIGITALE ---
+    
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(CONFIG.PARTICLE_COUNT * 3);
+    const colors = new Float32Array(CONFIG.PARTICLE_COUNT * 3);
+
+    const color1 = new THREE.Color(0x00ffff); // Ciano Elettrico
+    const color2 = new THREE.Color(0xffffff); // Bianco
+
+    for (let i = 0; i < CONFIG.PARTICLE_COUNT; i++) {
+        const i3 = i * 3;
+        
+        // Coordinate Sferiche Uniformi
+        // Usiamo Math.acos per evitare accumulo ai poli (distribuzione uniforme)
+        const u = Math.random();
+        const v = Math.random();
+        const theta = 2 * Math.PI * u;
+        const phi = Math.acos(2 * v - 1);
+        
+        // Conversione in Cartesiane
+        const r = CONFIG.RADIUS;
+        positions[i3] = r * Math.sin(phi) * Math.cos(theta);
+        positions[i3+1] = r * Math.sin(phi) * Math.sin(theta);
+        positions[i3+2] = r * Math.cos(phi);
+
+        // Colore: Mix casuale tra Ciano e Bianco per scintillio statico
+        const mixedColor = color1.clone().lerp(color2, Math.random() * 0.3);
+        colors[i3] = mixedColor.r;
+        colors[i3+1] = mixedColor.g;
+        colors[i3+2] = mixedColor.b;
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    const material = new THREE.PointsMaterial({
+        size: 0.05, // Molto piccolo per alta definizione
+        map: createDigitalTexture(),
+        vertexColors: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        transparent: true,
+        opacity: 0.9,
+        sizeAttenuation: true // Le particelle diventano più piccole se lontane
+    });
+
+    const sphereMesh = new THREE.Points(geometry, material);
+    scene.add(sphereMesh);
+
+    // --- 3. COMPUTER VISION (MEDIA PIPE) ---
+    
+    const statusText = document.getElementById('status-text');
+    const loader = document.getElementById('loader');
+
+    // Helper per distanza euclidea
+    const dist = (p1, p2) => Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    
+    hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1, // 1 = Accuratezza bilanciata
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(results => {
+        // UI Feedback
+        if(loader.style.opacity !== '0') {
+            loader.style.opacity = '0';
+            setTimeout(() => loader.style.display = 'none', 500);
+        }
+
+        const numHands = results.multiHandLandmarks.length;
+        state.isTracking = numHands > 0;
+        state.isZooming = numHands === 2;
+
+        if (state.isZooming) {
+            statusText.innerText = "MODALITÀ ZOOM";
+            
+            // Logica Zoom 2 Mani
+            const h1 = results.multiHandLandmarks[0][9]; // Medio mano 1
+            const h2 = results.multiHandLandmarks[1][9]; // Medio mano 2
+            
+            // Distanza normalizzata (0.0 - 1.0)
+            const d = dist(h1, h2);
+            
+            // Mappatura inversa: Mani vicine = Lontano, Mani larghe = Vicino
+            // Range Zoom: 18 (Lontano) -> 4 (Vicino)
+            let z = 20 - (d * 25);
+            state.targetZoom = Math.max(4, Math.min(20, z));
+
+        } else if (state.isTracking) {
+            statusText.innerText = "CONTROLLO ROTAZIONE";
+            
+            // Logica Rotazione 1 Mano
+            const hand = results.multiHandLandmarks[0];
+            const thumb = hand[4]; 
+            const index = hand[8];
+            
+            // Punto centrale di controllo (tra pollice e indice)
+            // Specchiamo la X (1.0 - x) per rendere il movimento naturale
+            state.targetHand.x = 1.0 - (thumb.x + index.x) / 2;
+            state.targetHand.y = (thumb.y + index.y) / 2;
+
+        } else {
+            statusText.innerText = "NESSUNA MANO RILEVATA";
+        }
+    });
+
+    // Avvio Camera
+    const cameraUtils = new Camera(document.getElementById('input_video'), {
+        onFrame: async () => { await hands.send({image: document.getElementById('input_video')}); },
+        width: 640, height: 480
+    });
+    cameraUtils.start();
+
+    // --- 4. LOOP DI ANIMAZIONE E FISICA ---
+    
+    const clock = new THREE.Clock();
+
+    function animate() {
+        requestAnimationFrame(animate);
+        const dt = clock.getDelta();
+
+        // A. FISICA ROTAZIONE (Solo se non stiamo zoomando)
+        if (state.isTracking && !state.isZooming) {
+            // Smoothing Posizione Mano (Lerp)
+            state.hand.x += (state.targetHand.x - state.hand.x) * CONFIG.SMOOTHING_HAND;
+            state.hand.y += (state.targetHand.y - state.hand.y) * CONFIG.SMOOTHING_HAND;
+
+            // Calcolo Delta (Velocità del movimento)
+            const dx = state.hand.x - state.prevHand.x;
+            const dy = state.hand.y - state.prevHand.y;
+
+            // Applicazione Impulso alla Rotazione
+            state.rotVel.y += dx * CONFIG.ROTATION_SPEED;
+            state.rotVel.x += dy * CONFIG.ROTATION_SPEED;
+
+            // Aggiorna storico
+            state.prevHand.x = state.hand.x;
+            state.prevHand.y = state.hand.y;
+        }
+
+        // Applicazione Velocità e Inerzia
+        sphereMesh.rotation.y += state.rotVel.y;
+        sphereMesh.rotation.x += state.rotVel.x;
+
+        // Attrito (Friction)
+        state.rotVel.x *= CONFIG.INERTIA;
+        state.rotVel.y *= CONFIG.INERTIA;
+
+        // Rotazione minima automatica per mantenere "vita"
+        if (!state.isTracking && Math.abs(state.rotVel.y) < 0.001) {
+            state.rotVel.y += 0.0002;
+        }
+
+        // B. FISICA ZOOM (Interpolazione morbida)
+        state.zoom += (state.targetZoom - state.zoom) * CONFIG.ZOOM_SPEED;
+        camera.position.z = state.zoom;
+
+        // Render
+        renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // Gestione Resize Finestra
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+</script>
+</body>
+</html>
